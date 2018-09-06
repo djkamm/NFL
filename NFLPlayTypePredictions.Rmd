@@ -1,0 +1,275 @@
+---
+title: "NFLPlayTypePredictions"
+author: "David Kamm"
+date: "August 30, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(readr)
+library(tidyverse)
+library(Amelia)
+library(caret)
+```
+
+# NFL Play Type Prediction Model
+
+The purpose of this model is to predict the NFL play type under specific conditions and given specific rules and definitions detailed below.  There are 2 separate Play Prediction Models:
+* Basic Play Type (Run or Pass)
+* Detail Play Type (Run with run gap or Pass with pass depth)
+
+Examples of specific conditions include but are not limited to:
+
+* Prediction odel does not apply in 4th down situations.  Applicable on 1st through 3rd down only.  
+* Prediction model does not apply to last 2 minutes of half or overtime situations
+
+Examples of Specific Rules:
+
+* Sacks are classified as Pass Plays
+* Plays that result in an accepted penalty are non-plays and do not count either as a pass play or a run play.
+
+These are the most primary / obvious rules and limitations.  There are additional details and rules of use pointed out in rhe detail below.
+
+### Import Data
+
+To import data.  This data is available from Kaggle at [link] (https://www.kaggle.com/datasets)
+```{r import rawData, message=FALSE, eval = FALSE}
+#Remove Directory in final document
+rawData <- read_csv("C:/Users/David Kamm/My Documents/Data Science Projects/NFL Play by Play/NFL Play by Play 2009-2017 (v4).csv")
+```
+
+### Basic Data Reduction
+
+In this section, we will apply basic record filtering.  The final prediction model is not intended to predict Play Type on 4th Down.  Nor is it intended to predict Play Type in the last 2 minutes of either half or overtime. In addition, 'miscellaneous' plays (field goal, punt, kickoff, extra point, etc) are also removed from the data set and prediction model.
+```{r Basic Record Filtering, cache = TRUE, dependson = "rawData"}
+relevantData <- rawData[rawData$down %in% c(1,2,3),]
+relevantData <- relevantData[relevantData$TimeSecs > 1920 | relevantData$TimeSecs <= 1800 & relevantData$qtr !=2, ]
+relevantData <- relevantData[relevantData$TimeSecs > 120,]
+relevantData <- relevantData[relevantData$PlayType %in% c('Pass', 'Run', 'Sack'),]
+```
+
+
+The raw data contains 4 fields that are obviously not necessary for pre-processing and are also not of use in modeling.  These fields will be removed.
+```{r Basic Field Reduction, cache = TRUE, dependson = "relevantData"}
+colImportance <- names(relevantData)
+colImportance <- as.data.frame(colImportance)
+colImportance$keep = 1
+colImportance[c(6, 14, 20, 81:101),]$keep = 0
+keep <- colImportance$keep
+keep <- as.logical(keep)
+relevantData <- relevantData[,keep]
+
+```
+
+### Reclassing Data and Additional Filtering
+
+Detail explanations provided in code comments
+```{r Reclass Data and Additional Filtering, cache = TRUE, dependson = "relevantData"}
+
+##Reclass any plays originally classified as 'Sack' to 'Pass'
+relevantData[relevantData$PlayType == 'Sack',]$PlayType = 'Pass'
+
+##Reclass Pass Length to 'Sack Impute' when field 'Sack' = 1.  This is for the purpose of identifying records necessary to impute.
+relevantData[relevantData$Sack == 1 & is.na(relevantData$PassLength), ]$PassLength = 'Impute'
+
+##When play description contains 'middle', reclass field 'RunGap' to 'middle'
+relevantData[is.na(relevantData$RunGap) & str_detect(relevantData$desc, 'middle') == 1, ]$RunGap = 'middle'
+
+##Reclass Pass Length to 'Impute' when empty.  This is for the purpose of identifying records necessary to impute.
+relevantData[relevantData$PlayType == 'Pass' & is.na(relevantData$PassLength), ]$PassLength = 'Impute'
+
+##Remove records where is.na(RunGap) & PlayType = 'Run' & str_detect(desc, Aborted') == 1
+##Remove aborted plays.  These plays are also exempt from prediction model usage.
+flag <- relevantData$PlayType == 'Run' & is.na(relevantData$RunGap) & str_detect(relevantData$desc, 'Aborted')
+flag <- !flag
+relevantData <- relevantData[flag,]
+
+##When play description contains 'guard' and field 'RunGap' is empty, reclass field 'RunGap' to 'guard'
+relevantData[relevantData$PlayType == 'Run' & is.na(relevantData$RunGap) & str_detect(relevantData$desc, 'guard') == 1, ]$RunGap = 'guard'
+
+##When play description contains 'tackle' and field 'RunGap' is empty, reclass field 'RunGap' to 'tackle'
+relevantData[relevantData$PlayType == 'Run' & is.na(relevantData$RunGap) & str_detect(relevantData$desc, 'tackle') == 1, ]$RunGap = 'tackle'
+
+##When play description contains 'end' and field 'RunGap' is empty, reclass field 'RunGap' to 'end'
+relevantData[relevantData$PlayType == 'Run' & is.na(relevantData$RunGap) & str_detect(relevantData$desc, 'end') == 1, ]$RunGap = 'end'
+
+##Remove 'Play Under Review' records, as these are not actual plays.
+flag <- relevantData$PlayType == 'Run' & is.na(relevantData$RunGap) & str_detect(relevantData$desc, 'play under review')
+flag <- !flag
+relevantData <- relevantData[flag,]
+
+##Remove 16 miscellaneous records where play description revealed record was not an actual play
+relevantData <- relevantData[-c(5502, 26625, 29631, 51927, 68727, 71259, 72879, 84467, 96879, 115280, 195025, 204505, 205358, 212650, 225194, 227938),]
+
+##Reclass is.na(RunGap) to 'Impute' when PlayType = 'Run' & is.na(RunGap)
+##Reclass RunGap to 'Impute' when empty.  This is for the purpose of identifying records necessary to impute.
+relevantData[relevantData$PlayType == 'Run' & is.na(relevantData$RunGap), ]$RunGap = 'Impute'
+
+##Reclass RunGap to NA for Pass Plays
+relevantData[relevantData$PlayType == 'Pass' & !is.na(relevantData$RunGap),]$RunGap = NA
+```
+
+### Import and Merge Additional Attributes
+
+Additional play attributes were generated offline.  These attributes have potential value in predicting play calls, but were not included in the Kaggle dataset.  These additional attributes include:
+* Week of Season
+* Count of Season to Date Wins for Home Team
+* Difference in Win Count between Home and Visiting Teams
+* Flag indicating Divisional Game
+
+***Excel file for import is contained separately***
+```{r Import and Merge Additional Attributes, cache = TRUE, message = FALSE, dependson = "relevantData"}
+ScheduleStats <- read_csv("C:/Users/David Kamm/My Documents/Data Science Projects/NFL Play by Play/ScheduleStats.csv")
+relevantData <- merge(relevantData, ScheduleStats)
+```
+
+### Keep only fields necessary for remaining pre-processing and pertinent to modeling
+
+Remove all fields redundant to additional pre-processing activities and that are obviously not pertinent to modeling
+```{r Remove all remainign unnecessary fields,  cache = TRUE, dependson = "relevantData"}
+keptColumns <- c('Drive', 'down', 'TimeSecs', 'yrdline100', 'ydstogo', 'posteam', 'DefensiveTeam', 'PlayType', 'PassLength', 'AirYards', 'QBHit', 'RunGap', 'Sack', 'PosTeamScore', 'ScoreDiff', 'HomeTeam', 'AwayTeam', 'posteam_timeouts_pre', 'Season', 'Week', 'HomeTeamGamesWon', 'HomeVsAwayGamesWon', 'DivisionGame')
+ImpCol <- as.data.frame(colnames(relevantData))
+ImpCol$keep = 0
+row.names(ImpCol) = ImpCol$`colnames(relevantData)`
+ImpCol[row.names(ImpCol) %in% keptColumns,]$keep = 1
+keep <- ImpCol$keep
+keep <- as.logical(keep)
+playCallData <- relevantData[,keep]
+```
+
+### Additional Reclassing and readying data for Impution
+
+Change field types to factor and replace values of 'Impute' with NA
+```{r Additional Reclassing and readying data for Impution, cache = TRUE, dependson = "playCallData"}
+##Reclass various fields as factor
+playCallData$posteam <- as.factor(playCallData$posteam)
+playCallData$DefensiveTeam <- as.factor(playCallData$DefensiveTeam)
+playCallData$PlayType <- as.factor(playCallData$PlayType)
+playCallData$PassLength <- as.factor(playCallData$PassLength)
+playCallData$RunGap <- as.factor(playCallData$RunGap)
+playCallData$HomeTeam <- as.factor(playCallData$HomeTeam)
+playCallData$AwayTeam <- as.factor(playCallData$AwayTeam)
+
+##Reclass values of 'Impute' to NA
+RunGap <- playCallData$RunGap
+RunGap[RunGap == 'Impute'] = NA
+playCallData$RunGap = RunGap
+PassLength <- playCallData$PassLength
+PassLength[PassLength == 'Impute'] = NA
+playCallData$PassLength <- PassLength
+```
+
+### Impute Values for RunGap and PassLength
+
+1. Separate data into two separate datasets (one for run plays and one for pass plays), since Impution of RunGap values is dependent on different variables than PassLength values.
+2. Impute individual RunGap and PassLength values
+3. Incorporate imputed values into both individual run and pass datasets and combined dataset
+
+```{r Impute Values for RunGap and PassLength, cache = TRUE, message = FALSE, results = 'hide', dependson = "playCallData"}
+##Separate playCallData into individual data sets for pass and run in order to impute values
+playCallData$seq <- 1:nrow(playCallData)
+seq <- playCallData$seq
+playCallDataPass <- playCallData[playCallData$PlayType == 'Pass',]
+playCallDataRun <- playCallData[playCallData$PlayType == 'Run',]
+
+##Impute RunGap values and insert into Run Play data
+RunGapImputionValues <- c('Drive', 'down', 'TimeSecs', 'yrdline100', 'ydstogo', 'RunGap', 'PosTeamScore', 'ScoreDiff', 'posteam_timeouts_pre', 'Season', 'Week', 'HomeTeamGamesWon', 'HomeVsAwayGamesWon', 'DivisionGame')
+playCallDataRun <- playCallDataRun[,RunGapImputionValues]
+amelia_fit <- amelia(playCallDataRun, m=1, parallel = "multicore", noms = "RunGap")
+playCallDataRun$RunGap <- amelia_fit$imputations[[1]]$RunGap
+
+##Impute assLength values and insert into Pass Play data
+PassLengthImputionValues <- c('Drive', 'down', 'TimeSecs', 'yrdline100', 'ydstogo', 'PassLength', 'AirYards', 'QBHit', 'Sack', 'PosTeamScore', 'ScoreDiff', 'posteam_timeouts_pre', 'Season', 'Week', 'HomeTeamGamesWon', 'HomeVsAwayGamesWon', 'DivisionGame')
+playCallDataPass <- playCallDataPass[,PassLengthImputionValues]
+amelia_fit <- amelia(playCallDataPass, m=1, parallel = "multicore", noms = "PassLength")
+playCallDataPass$PassLength <- amelia_fit$imputations[[1]]$PassLength
+
+##Overwrite Missing Values into playCallData
+playCallData[playCallData$PlayType =='Run',]$RunGap = playCallDataRun$RunGap
+playCallData[playCallData$PlayType =='Pass',]$PassLength = playCallDataPass$PassLength
+```
+
+### Create alternate dependent variable and separate datasets for remaining preprocessing and modeling
+
+* The original dependent variable is simply a run or a pass play.
+* The alternate dependent variable breaks down pass plays into long or short, and breaks down run plays based on run gap (i.e. end, tackle, middle)
+```{r create second dependent variable and separate datasets, cache = TRUE, dependson = 'playCallData'}
+playCallData$PlayTypeDetail <- as.factor(paste(playCallData$PlayType,"-",playCallData$PassLength,"-",
+                                               playCallData$RunGap))
+BasicColumns <- c('Drive', 'down', 'TimeSecs', 'yrdline100', 'ydstogo', 'posteam', 'DefensiveTeam', 'PlayType',  'PosTeamScore', 'ScoreDiff', 'HomeTeam', 'AwayTeam', 'posteam_timeouts_pre', 'Season', 'Week', 'HomeTeamGamesWon', 'HomeVsAwayGamesWon', 'DivisionGame')
+playCallDataBasic <- playCallData[,BasicColumns]
+DetailColumns <- c('Drive', 'down', 'TimeSecs', 'yrdline100', 'ydstogo', 'posteam', 'DefensiveTeam', 'PosTeamScore', 'ScoreDiff', 'HomeTeam', 'AwayTeam', 'posteam_timeouts_pre', 'Season', 'Week', 'HomeTeamGamesWon', 'HomeVsAwayGamesWon', 'DivisionGame', 'PlayTypeDetail')
+playCallDataDetail <- playCallData[,DetailColumns]
+```
+
+### Pre-Processing 
+
+Pre-Processing must be done twice, once for the basic play type prediction model and once for the detail play type prediction model.  After pre-processing, the dependent variable(s) are then added back to each of the two data sets prior to data splitting and model evaluation 
+```{r Pre-Processing, message = FALSE, warning = FALSE, cache = TRUE, eval = FALSE}
+##Create Dummy Variables
+dummiesBasic <- dummyVars(PlayType ~ ., data = playCallDataBasic)
+predictorsBasicPlayType <- as.data.frame(predict(dummiesBasic, newdata = playCallDataBasic))
+dummiesDetail <- dummyVars(PlayTypeDetail ~ ., data = playCallDataDetail)
+predictorsDetailPlayType <- as.data.frame(predict(dummiesDetail, newdata = playCallDataDetail))
+
+##Remove Near Zero Value Predictors
+nzvBasic <- nearZeroVar(predictorsBasicPlayType)
+predictorsBasicPlayTypeFiltered <- predictorsBasicPlayType[, -nzvBasic]
+nzvDetail <- nearZeroVar(predictorsDetailPlayType)
+predictorsDetailPlayTypeFiltered <- predictorsDetailPlayType[, -nzvDetail]
+
+##Remove Highly Correlated Predictors
+descrCorBasic <- cor(predictorsBasicPlayTypeFiltered)
+highlyCorDescrBasic <- findCorrelation(descrCorBasic, cutoff = .75)
+predictorsBasicPlayTypeFiltered2 <- predictorsBasicPlayTypeFiltered[,-highlyCorDescrBasic]
+descrCorDetail <- cor(predictorsDetailPlayTypeFiltered)
+highlyCorDescrDetail <- findCorrelation(descrCorDetail, cutoff = .75)
+predictorsDetailPlayTypeFiltered2 <- predictorsDetailPlayTypeFiltered[,-highlyCorDescrDetail]
+
+##Note no linear combinations to remove
+
+##Add Dependent Variable to dataset prior to data splitting
+predictorsBasicPlayTypeFiltered2$PlayType <- playCallDataBasic$PlayType
+predictorsDetailPlayTypeFiltered2$PlayTypeDetail <- playCallDataDetail$PlayTypeDetail
+```
+
+### Partition into test and training sets
+
+Note that centering and/or scaling the data did not make a meterial difference in model building.  Prediction models were built on data without centering and scaling and separately including centering and scaling. Since the models performed essentially the same with and without, centering and scaling data is omitted here.
+```{r Partition into test and training sets, cache = TRUE, eval = FALSE}
+trainIndex <- createDataPartition(playCallData$PlayType, p = .8, list = F, times = 1)
+trainingBasic <- predictorsBasicPlayTypeFiltered2[trainIndex,]
+testBasic <- predictorsBasicPlayTypeFiltered2[-trainIndex,]
+trainingDetail <- predictorsDetailPlayTypeFiltered2[trainIndex,]
+testDetail <- predictorsDetailPlayTypeFiltered2[-trainIndex,]
+
+##Note: Centering and Scaling the data did not make a material difference in 
+#preProcValues <- preProcess(training, method = c("center", "scale"))
+#trainTransformed <- predict(preProcValues, training)
+#testTransformed <- predict(preProcValues, test)
+```
+
+### Predictive Modeling
+
+The process of determining the best predictive model started by using EXtreme Gradient Boosting (xgbTree), probably the methodology that has seen the best and highly publicized results over the last several years.
+
+In order to determine optimum parameter values, an adaptive resampling process was implemented in conjunction with the `caret train` function 
+```{r Predictive Modeling, cache = TRUE, eval = FALSE, message = FALSE}
+fitControl <- trainControl(method = "adaptive_cv", 
+                           number = 10, 
+                           adaptive = list(min = 5, alpha = 0.05, 
+                                           method = "gls", complete = TRUE),
+                           search = 'random')
+xgbFitBasic <- train(PlayType ~., data = trainingBasic, method = 'xgbTree', trControl = fitControl, tuneLength = 20)
+xgbFitDetail <- train(PlayTypeDetail ~., data = trainingDetail, method = 'xgbTree', trControl = fitControl, tuneLength = 20)
+```
+
+## Results
+
+```{r Results}
+xgbPredBasic <- predict(xgbFitBasic, testBasic)
+testBasicWithResults <- cbind(testBasic, xgbPredBasic)
+table(testBasicWithResults$xgbPredBasic, testBasicWithResults$PlayType, testBasicWithResults$down)
+```
+
