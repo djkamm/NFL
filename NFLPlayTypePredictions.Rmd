@@ -1,3 +1,4 @@
+
 ---
 title: "NFLPlayTypePredictions"
 author: "David Kamm"
@@ -19,10 +20,11 @@ The purpose of this model is to predict the NFL play type under specific conditi
 * Basic Play Type (Run or Pass)
 * Detail Play Type (Run with run gap or Pass with pass depth)
 
-Examples of specific conditions include but are not limited to:
+Examples of specific conditions required for accurate model predictions include but are not limited to:
 
-* Prediction odel does not apply in 4th down situations.  Applicable on 1st through 3rd down only.  
+* Prediction model does not apply in 4th down situations.  Applicable on 1st through 3rd down only.  
 * Prediction model does not apply to last 2 minutes of half or overtime situations
+* Prediction model does not apply when the QB fumbles the ball during the play, regardless of the ultimate outcome of the play.  These plays are considered aborted.
 
 Examples of Specific Rules:
 
@@ -79,8 +81,7 @@ relevantData[is.na(relevantData$RunGap) & str_detect(relevantData$desc, 'middle'
 ##Reclass Pass Length to 'Impute' when empty.  This is for the purpose of identifying records necessary to impute.
 relevantData[relevantData$PlayType == 'Pass' & is.na(relevantData$PassLength), ]$PassLength = 'Impute'
 
-##Remove records where is.na(RunGap) & PlayType = 'Run' & str_detect(desc, Aborted') == 1
-##Remove aborted plays.  These plays are also exempt from prediction model usage.
+##Remove aborted plays (plays are classified as aborted if the Quarterback fumbles the ball, irrespective of what team or player recovers the ball).  These plays are also exempt from prediction model usage.
 flag <- relevantData$PlayType == 'Run' & is.na(relevantData$RunGap) & str_detect(relevantData$desc, 'Aborted')
 flag <- !flag
 relevantData <- relevantData[flag,]
@@ -119,7 +120,7 @@ Additional play attributes were generated offline.  These attributes have potent
 * Flag indicating Divisional Game
 
 ***Excel file for import is contained separately***
-```{r Import and Merge Additional Attributes, cache = TRUE, message = FALSE, dependson = "relevantData"}
+```{r Import and Merge Additional Attributes, cache = TRUE, message = FALSE, dependson = "relevantData", eval = TRUE}
 ScheduleStats <- read_csv("C:/Users/David Kamm/My Documents/Data Science Projects/NFL Play by Play/ScheduleStats.csv")
 relevantData <- merge(relevantData, ScheduleStats)
 ```
@@ -244,10 +245,7 @@ testBasic <- predictorsBasicPlayTypeFiltered2[-trainIndex,]
 trainingDetail <- predictorsDetailPlayTypeFiltered2[trainIndex,]
 testDetail <- predictorsDetailPlayTypeFiltered2[-trainIndex,]
 
-##Note: Centering and Scaling the data did not make a material difference in 
-#preProcValues <- preProcess(training, method = c("center", "scale"))
-#trainTransformed <- predict(preProcValues, training)
-#testTransformed <- predict(preProcValues, test)
+##Note: Centering and Scaling the data did not make a material difference in optimizing model predictions and so was not used here
 ```
 
 ### Predictive Modeling
@@ -262,14 +260,37 @@ fitControl <- trainControl(method = "adaptive_cv",
                                            method = "gls", complete = TRUE),
                            search = 'random')
 xgbFitBasic <- train(PlayType ~., data = trainingBasic, method = 'xgbTree', trControl = fitControl, tuneLength = 20)
+## Note that I was only able to get the following model training to work when using parallel processing.  When using single core processing my R session aborted every time.
 xgbFitDetail <- train(PlayTypeDetail ~., data = trainingDetail, method = 'xgbTree', trControl = fitControl, tuneLength = 20)
 ```
 
 ## Results
 
-```{r Results}
+The basic (run or pass) prediction model yields strong results, with correct predictions 67-68% of the time vs a 56% no information rate.  
+```{r Basic Results, cache = TRUE, eval = TRUE, message = FALSE, fig.align = 'center'}
 xgbPredBasic <- predict(xgbFitBasic, testBasic)
 testBasicWithResults <- cbind(testBasic, xgbPredBasic)
-table(testBasicWithResults$xgbPredBasic, testBasicWithResults$PlayType, testBasicWithResults$down)
+confusionMatrix(xgbPredBasic, reference = testBasic$PlayType)
+##Basic Prediction Accuracy by Down
+BasicPlayCallFirstDown <- (table(testBasicWithResults$xgbPredBasic, testBasicWithResults$PlayType, testBasicWithResults$down)[1,1,1]+table(testBasicWithResults$xgbPredBasic, testBasicWithResults$PlayType, testBasicWithResults$down)[2,2,1]) / dim(testBasicWithResults[testBasicWithResults$down ==1,])[1]
+NoInformationFirstDown <- (table(testBasicWithResults$xgbPredBasic, testBasicWithResults$PlayType, testBasicWithResults$down)[1,2,1]+table(testBasicWithResults$xgbPredBasic, testBasicWithResults$PlayType, testBasicWithResults$down)[2,2,1]) / dim(testBasicWithResults[testBasicWithResults$down ==1,])[1]
+BasicPlayCallSecondDown <- (table(testBasicWithResults$xgbPredBasic, testBasicWithResults$PlayType, testBasicWithResults$down)[1,1,2]+table(testBasicWithResults$xgbPredBasic, testBasicWithResults$PlayType, testBasicWithResults$down)[2,2,2]) / dim(testBasicWithResults[testBasicWithResults$down ==2,])[1]
+NoInformationSecondDown <- (table(testBasicWithResults$xgbPredBasic, testBasicWithResults$PlayType, testBasicWithResults$down)[1,1,2]+table(testBasicWithResults$xgbPredBasic, testBasicWithResults$PlayType, testBasicWithResults$down)[2,1,2]) / dim(testBasicWithResults[testBasicWithResults$down ==2,])[1]
+BasicPlayCallThirdDown <- (table(testBasicWithResults$xgbPredBasic, testBasicWithResults$PlayType, testBasicWithResults$down)[1,1,3]+table(testBasicWithResults$xgbPredBasic, testBasicWithResults$PlayType, testBasicWithResults$down)[2,2,3]) / dim(testBasicWithResults[testBasicWithResults$down ==3,])[1]
+NoInformationThirdDown <- (table(testBasicWithResults$xgbPredBasic, testBasicWithResults$PlayType, testBasicWithResults$down)[1,1,3]+table(testBasicWithResults$xgbPredBasic, testBasicWithResults$PlayType, testBasicWithResults$down)[2,1,3]) / dim(testBasicWithResults[testBasicWithResults$down ==3,])[1]
+BasicPlayCallByDown <- c(BasicPlayCallFirstDown, BasicPlayCallSecondDown, BasicPlayCallThirdDown)
+NoInformation <- data.frame(Down = c('First', 'Second', 'Third'), Type = 'NoInformation', Rate = c(NoInformationFirstDown, NoInformationSecondDown, NoInformationThirdDown))
+Predicted <- data.frame(Down = c('First', 'Second', 'Third'), Type = 'Predicted', Rate = c(BasicPlayCallFirstDown, BasicPlayCallSecondDown, BasicPlayCallThirdDown))
+Comparison <- rbind(NoInformation, Predicted)
+ggplot(Comparison, aes(x = Down, y = Rate, fill = Type)) + geom_bar(position = 'dodge', stat = 'identity') + ggtitle('Correct Prediction Rate vs No Information Rate') + theme(plot.title = element_text(hjust = 0.5, face = 'bold')) + scale_y_continuous(labels = scales::percent)
+```
+
+The detail model prediction results are not as strong as expected due to the fact that almost all (99%+) play predicted as a pass are predicted to be a short (<=15 yards) pass.  In order to change the predictions to include a greater percentage of pass plays to be long passes, the model would need to use a different metric and/or include a penalty for wrong predictions (not done here).
+
+```{r Detail Results, cache = TRUE, eval = TRUE, message = FALSE}
+xgbPredDetail <- predict(xgbFitDetail, testDetail)
+testDetailWithResults <- cbind(testDetail, xgbPredDetail)
+confusionMatrix(xgbPredDetail, reference = testDetail$PlayTypeDetail)
+```
 ```
 
